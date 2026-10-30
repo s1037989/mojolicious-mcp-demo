@@ -1,0 +1,11 @@
+#!/usr/bin/env perl
+use Mojo::Base -strict, -signatures;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use MCPDemo::Server;
+use Crypt::PRNG qw(random_bytes);
+
+# Stdio trusts the local process owner. HTTP bearer auth and scope checks do
+# not apply. Per-caller event filters deliberately keep admin primitives hidden.
+# A fresh per-process state key is correct for this single stdio process.
+MCPDemo::Server->build(state_secret => random_bytes(32))->to_stdio;

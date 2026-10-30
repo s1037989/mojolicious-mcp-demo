@@ -1,0 +1,59 @@
+#!/usr/bin/env perl
+use Mojo::Base -strict, -signatures;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Crypt::JWT qw(encode_jwt);
+use Crypt::PK::RSA;
+use Crypt::PRNG qw(random_bytes);
+use Getopt::Long qw(GetOptions);
+use Mojo::File qw(path);
+use Mojo::JSON qw(encode_json false true);
+use MCPDemo::Config;
+
+my $dir = MCPDemo::Config::root()->child('var')->to_string;
+my ($streaming, $renew) = (0, 0);
+GetOptions('dir=s' => \$dir, 'streaming!' => \$streaming, 'renew!' => \$renew) or die "Invalid options\n";
+umask 0077;
+my $var = path($dir)->to_abs;
+$var->make_path;
+chmod 0700, "$var" or die "Cannot restrict permissions on $var: $!\n";
+my $config_file = $var->child('server.json');
+my ($key, $config);
+if ($renew) {
+  die "Run demo-setup once before --renew\n" unless -f $config_file;
+  $config = MCPDemo::Config->load($config_file);
+  my $private = $var->child('demo-private.pem')->slurp;
+  $key = Crypt::PK::RSA->new(\$private);
+  my $public = $config->{public_key};
+  die "The demo private key does not match the configured public key\n"
+    unless $key->export_key_pem('public') eq Crypt::PK::RSA->new(\$public)->export_key_pem('public');
+} else {
+  die "Configuration already exists; use --renew for fresh tokens or --dir for a separate demo\n" if -e $config_file;
+  $key = Crypt::PK::RSA->new->generate_key(256, 65537);
+  $var->child('demo-private.pem')->spurt($key->export_key_pem('private'));
+  chmod 0600, $var->child('demo-private.pem')->to_string or die "Cannot restrict private-key permissions: $!\n";
+  $config = {
+    base_url => 'http://127.0.0.1:3000', audience => 'http://127.0.0.1:3000/mcp',
+    issuer => 'https://demo-issuer.invalid', public_key => $key->export_key_pem('public'),
+    state_secret => unpack('H*', random_bytes(32)), streaming => $streaming ? true : false,
+    allowed_origins => ['http://127.0.0.1:3000'], revoked_jti => []
+  };
+  $config_file->spurt(encode_json($config));
+  chmod 0600, "$config_file" or die "Cannot restrict configuration permissions: $!\n";
+}
+my %profiles = (
+  reader => {sub => 'alice', role => 'user', scope => 'mcp:read'},
+  writer => {sub => 'bob', role => 'user', scope => 'mcp:read mcp:write mcp:admin'},
+  admin => {sub => 'carol', role => 'admin', scope => 'mcp:read mcp:write mcp:admin'}
+);
+for my $name (sort keys %profiles) {
+  my $claims = {%{$profiles{$name}}, iss => $config->{issuer}, aud => $config->{audience},
+    iat => time, nbf => time, exp => time + 3600, jti => unpack('H*', random_bytes(16))};
+  my $token = encode_jwt(payload => $claims, key => $key, alg => 'RS256', extra_headers => {typ => 'at+jwt'});
+  $var->child("$name.token")->spurt("$token\n");
+  chmod 0600, $var->child("$name.token")->to_string or die "Cannot restrict token permissions: $!\n";
+}
+say "Created one-hour reader, writer and admin tokens in $var";
+say 'The writer deliberately has mcp:admin scope but lacks the admin role.';
+say 'Demo credentials are generated locally; no OAuth login or token endpoint is provided.';
+say "Server config: $config_file";
